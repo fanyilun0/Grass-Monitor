@@ -15,13 +15,14 @@ from config import (
     INTERVAL, 
     TIME_OFFSET,
     ALWAYS_NOTIFY,
-    APP_NAME
+    APP_NAME,
+    SHOW_DETAIL
 )
 
 # 新增：随机延迟函数
 async def random_delay():
     """生成随机延迟时间（3-10秒）"""
-    delay = random.uniform(1, 1)
+    delay = random.uniform(3, 100)
     print(f"等待 {delay:.2f} 秒...")
     await asyncio.sleep(delay)
 
@@ -199,8 +200,9 @@ async def fetch_nodes_data(session, api_url, api_token):
                 
                 # 获取原始节点数据
                 raw_nodes = data.get('result', {}).get('data', {}).get('data', [])
-                print(f"获取到的节点数量: {len(raw_nodes)}")
-                print(f"节点数据结构: {raw_nodes}")
+                if SHOW_DETAIL:
+                    print(f"获取到的节点数量: {len(raw_nodes)}")
+                    print(f"节点数据结构: {raw_nodes}")
                 
                 if raw_nodes:
                     try:
@@ -364,12 +366,11 @@ def extract_node_info(node, time_offset=8):
         f"  设备ID: {info['deviceId'][:8]}...",
         f"  名称: {info['name']}",
         f"  状态: {'🟢 在线' if info['isConnected'] else '🔴 离线'}",
-        f"  IP: {info['ipAddress']} (评分: {info['ipScore']})",
+        f"  IP: {info['ipAddress']} (评分: {info['ipScore']}) {'' if info['ipScore'] == 100 else '🔴'}",
         f"  地区: {info['countryCode']}",
         f"  倍率: {info['multiplier']}x",
         f"  积分: {info['totalPoints']}",
         f"  运行时间: {info['totalUptime']}秒",
-        f"  最后连接: {info['lastConnectedAt']}"
         f"  最后连接: {format_timestamp(info['lastConnectedAt'], time_offset)}"
     ]
     
