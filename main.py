@@ -21,7 +21,7 @@ from config import (
 # 新增：随机延迟函数
 async def random_delay():
     """生成随机延迟时间（3-10秒）"""
-    delay = random.uniform(30, 100)
+    delay = random.uniform(1, 1)
     print(f"等待 {delay:.2f} 秒...")
     await asyncio.sleep(delay)
 
@@ -104,6 +104,30 @@ def build_node_stats_message(token_name, username, result_data, total_uptime, on
             message_lines.append(f"    设备ID: {node['deviceId']}")
             message_lines.append(f"    IP分数: {node['ipScore']}")
     
+    # 检查重复IP
+    ip_count = {}
+    duplicate_ips = set()
+    for node in result_data:
+        ip = node.get('ipAddress')
+        if ip:
+            ip_count[ip] = ip_count.get(ip, 0) + 1
+            if ip_count[ip] > 1:
+                duplicate_ips.add(ip)
+    
+    # 在消息中添加重复IP警告
+    if duplicate_ips:
+        message_lines.extend([
+            f"\n⚠️ 重复IP警告 ({len(duplicate_ips)}):"
+        ])
+        for ip in duplicate_ips:
+            duplicate_nodes = [
+                node for node in result_data 
+                if node.get('ipAddress') == ip
+            ]
+            message_lines.append(f"  • IP: {ip}")
+            for node in duplicate_nodes:
+                message_lines.append(f"    设备ID: {node.get('deviceId')}")
+    
     return "\n".join(message_lines)
 
 def format_uptime(seconds):
@@ -173,33 +197,54 @@ async def fetch_nodes_data(session, api_url, api_token):
             elif response.status == 200:
                 data = await response.json()
                 
-                # 直接获取 result.data 数组
-                result_data = data.get('result', {}).get('data', [])
-                print(f"获取到的节点数量: {len(result_data)}")
+                # 获取原始节点数据
+                raw_nodes = data.get('result', {}).get('data', {}).get('data', [])
+                print(f"获取到的节点数量: {len(raw_nodes)}")
+                print(f"节点数据结构: {raw_nodes}")
                 
-                # 统计数据
-                total_uptime = sum(node['aggUptime'] for node in result_data)
-                online_nodes = [node for node in result_data if node['ipScore'] > 0]
-                offline_nodes = [node for node in result_data if node['ipScore'] == 0]
-                abnormal_score_nodes = [node for node in result_data if node['ipScore'] != 100]
-                
-                print(f"\n总在线时间: {total_uptime}秒")
-                print(f"在线节点数量: {len(online_nodes)}")
-                print(f"离线节点数量: {len(offline_nodes)}")
-                
-                # 打印离线节点的IP地址
-                if offline_nodes:
-                    print("\n离线节点IP列表:")
-                    for node in offline_nodes:
-                        print(f"- IP: {node['ipAddress']}, 设备ID: {node['deviceId']}")
-                
-                # 打印IP分数异常的节点
-                if abnormal_score_nodes:
-                    print("\nIP分数异常节点列表:")
-                    for node in abnormal_score_nodes:
-                        print(f"- IP: {node['ipAddress']}, 设备ID: {node['deviceId']}, IP分数: {node['ipScore']}")
-                
-                return result_data, total_uptime, len(online_nodes), len(offline_nodes)
+                if raw_nodes:
+                    try:
+                        # 提取每个节点的关键信息
+                        result_data = [extract_node_info(node) for node in raw_nodes]
+                        
+                        # 检查重复IP
+                        ip_count = {}
+                        duplicate_ips = set()
+                        for node in result_data:
+                            ip = node.get('ipAddress')
+                            if ip:
+                                ip_count[ip] = ip_count.get(ip, 0) + 1
+                                if ip_count[ip] > 1:
+                                    duplicate_ips.add(ip)
+                        
+                        # 如果发现重复IP，打印警告
+                        if duplicate_ips:
+                            print("\n⚠️ 发现重复IP:")
+                            for ip in duplicate_ips:
+                                duplicate_nodes = [
+                                    node for node in result_data 
+                                    if node.get('ipAddress') == ip
+                                ]
+                                print(f"IP {ip} 被以下设备使用:")
+                                for node in duplicate_nodes:
+                                    print(f"  - 设备ID: {node.get('deviceId')}")
+                        
+                        # 使用提取的数据计算统计信息
+                        total_uptime = sum(node['totalUptime'] for node in result_data)
+                        online_nodes = [node for node in result_data if node['ipScore'] > 0 and node['isConnected']]
+                        offline_nodes = [node for node in result_data if node['ipScore'] == 0 or not node['isConnected']]
+                        
+                        print(f"\n总在线时间: {total_uptime}秒")
+                        print(f"在线节点数量: {len(online_nodes)}")
+                        print(f"离线节点数量: {len(offline_nodes)}")
+                        
+                        return result_data, total_uptime, len(online_nodes), len(offline_nodes)
+                    except Exception as e:
+                        print(f"处理数据时出错: {str(e)}")
+                        raise
+                else:
+                    print("未获取到节点数据")
+                    return None, 0, 0, 0
             else:
                 print(f"API请求失败: {response.status}")
                 return None, 0, 0, 0
@@ -230,38 +275,6 @@ async def fetch_profile_data(session, api_token):
     except Exception as e:
         print(f"获取个人资料失败: {str(e)}")
         raise
-
-def compare_states(previous, current):
-    """比较两个状态的差异"""
-    changes = []
-    
-    for node in current:
-        node_id = node['_id']
-        prev_node = next((n for n in previous if n['_id'] == node_id), None)
-        
-        if not prev_node:
-            changes.append(f"新增节点: {node['pubKey']}")
-            continue
-            
-        # 检查连接状态变化
-        if node['isConnected'] != prev_node['isConnected']:
-            status = "上线" if node['isConnected'] else "离线"
-            changes.append(f"节点 {node['pubKey']} {status}")
-            
-        # 检查奖励变化
-        if node['totalReward'] != prev_node['totalReward']:
-            reward_diff = node['totalReward'] - prev_node['totalReward']
-            changes.append(f"节点 {node['pubKey']} 总奖励变化: +{reward_diff}")
-            
-        if node['todayReward'] != prev_node['todayReward']:
-            reward_diff = node['todayReward'] - prev_node['todayReward']
-            changes.append(f"节点 {node['pubKey']} 今日奖励变化: +{reward_diff}")
-            
-        # 检查sessions变化
-        if len(node['sessions']) != len(prev_node['sessions']):
-            changes.append(f"节点 {node['pubKey']} sessions数量变化: {len(prev_node['sessions'])} -> {len(node['sessions'])}")
-    
-    return changes
 
 async def monitor_nodes(interval, webhook_url, use_proxy, proxy_url, always_notify=False):
     """监控节点状态"""
@@ -300,55 +313,68 @@ async def monitor_token_with_session(token_config, webhook_url, use_proxy, proxy
             proxy_url=proxy_url
         )
 
-def format_point(point_value):
-    """将积分格式化为 x,xxx.x pt 格式"""
-    point = float(point_value) / 100000  # 转换为pt单位
-    return f"{point:,.1f} pt"
+def format_timestamp(timestamp_str, time_offset=8):
+    """
+    将UTC时间戳转换为本地时间
+    
+    Args:
+        timestamp_str: UTC时间字符串 (例如: '2024-12-02T03:19:01.000Z')
+        time_offset: 时区偏移量,默认为东八区(+8)
+    """
+    if not timestamp_str:
+        return "未知"
+        
+    try:
+        # 解析UTC时间字符串
+        utc_time = datetime.strptime(timestamp_str.replace('Z', ''), '%Y-%m-%dT%H:%M:%S.%f')
+        # 添加时区偏移
+        local_time = utc_time + timedelta(hours=time_offset)
+        # 格式化输出
+        return local_time.strftime('%Y-%m-%d %H:%M:%S')
+    except Exception as e:
+        print(f"时间转换错误: {e}")
+        return timestamp_str
 
-def build_status_message(current_state, profile_data, show_detail, online_nodes, expected_online):
-    """构建状态消息"""
-    adjusted_time = datetime.now() + timedelta(hours=TIME_OFFSET)
-    timestamp = adjusted_time.strftime('%Y-%m-%d %H:%M:%S')
+def extract_node_info(node, time_offset=8):
+    """提取节点的关键信息"""
+    info = {
+        # 基础信息
+        'deviceId': node.get('deviceId'),
+        'name': node.get('name'),
+        'type': node.get('type'),
+        
+        # 状态信息
+        'ipAddress': node.get('ipAddress'),
+        'ipScore': node.get('ipScore', 0),
+        'isConnected': node.get('isConnected', False),
+        'totalUptime': node.get('totalUptime', 0),
+        'lastConnectedAt': node.get('lastConnectedAt'),
+        
+        # 地理位置
+        'countryCode': node.get('countryCode'),
+        
+        # 性能指标
+        'multiplier': node.get('multiplier', 1),
+        'totalPoints': node.get('totalPoints', 0)
+    }
     
-    total_today = sum(node['today'] for node in current_state)
-    
-    # 获取积分信息
-    point_data = profile_data.get('point', {})
-    total_point = format_point(point_data.get('total', 0))
-    balance_point = format_point(point_data.get('balance', 0))
-    referral_point = format_point(point_data.get('referral', 0))
-    
-    # 获取节点信息
-    node_data = profile_data.get('node', {})
-    
-    # 添加节点状态警告
-    status_emoji = "✅" if online_nodes >= expected_online else "⚠️"
-    
-    message_lines = [
-        f"{status_emoji} 【Gradient状态报告】",
-        f"时间: {timestamp}\n",
-        f"💎 积分统计:",
-        f"  • 账号: {profile_data.get('name')}",
-        f"  • 总积分: {total_point}",
-        f"  • 可用积分: {balance_point}",
-        f"  • 推荐奖励: {referral_point}",
-        f"\n🖥️ 节点统计:",
-        f"  • 预期活跃: {expected_online}",
-        f"  • 在线节点: {online_nodes}",
-        f"  • 今日积分: {format_point(total_today)}"
+    # 格式化日志输出
+    log_message = [
+        f"节点信息摘要:",
+        f"  设备ID: {info['deviceId'][:8]}...",
+        f"  名称: {info['name']}",
+        f"  状态: {'🟢 在线' if info['isConnected'] else '🔴 离线'}",
+        f"  IP: {info['ipAddress']} (评分: {info['ipScore']})",
+        f"  地区: {info['countryCode']}",
+        f"  倍率: {info['multiplier']}x",
+        f"  积分: {info['totalPoints']}",
+        f"  运行时间: {info['totalUptime']}秒",
+        f"  最后连接: {info['lastConnectedAt']}"
+        f"  最后连接: {format_timestamp(info['lastConnectedAt'], time_offset)}"
     ]
     
-    if show_detail:
-        message_lines.extend(["\n📝 节点详情:"])
-        for node in current_state:
-            status_emoji = "✅" if node['connect'] else "❌"
-            message_lines.extend([
-                f"  • {node['name']} {status_emoji}",
-                f"    积分: {format_point(node['point'])} / 今日: {format_point(node['today'])}",
-                f"    延迟: {node['latency']}ms / 位置: {node['location']['country']}-{node['location']['place']}"
-            ])
-    
-    return "\n".join(message_lines)
+    print("\n".join(log_message))
+    return info
 
 if __name__ == "__main__":
     asyncio.run(monitor_nodes(
