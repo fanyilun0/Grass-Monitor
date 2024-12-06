@@ -3,6 +3,7 @@ import aiohttp
 from datetime import datetime, timedelta
 import random
 import json
+import logging
 
 # 导入配置
 from config import (
@@ -20,6 +21,19 @@ from config import (
     SHOW_DETAIL
 )
 
+# 配置logging
+def setup_logging():
+    """配置日志格式和级别"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    return logging.getLogger(__name__)
+
+# 获取logger实例
+logger = setup_logging()
+
 # 全局字典用于缓存上次的epoch收益数据
 previous_epoch_data_cache = {}
 
@@ -27,21 +41,24 @@ previous_epoch_data_cache = {}
 async def random_delay():
     """生成随机延迟时间（10-20秒）"""
     delay = random.uniform(10, 20)
-    print(f"等待 {delay:.2f} 秒...")
+    logger.info(f"等待 {delay:.2f} 秒...")
     await asyncio.sleep(delay)
 
 async def monitor_single_token(session, token_config, webhook_url, use_proxy, proxy_url):
     """监控单个token的节点状态和epoch收益"""
     try:
-        await random_delay()
-        
-        print(f"\n=== 检查Token: {token_config['name']} ===")
+        logger.info(f"{'='*50}")
+        logger.info(f"开始检查Token: {token_config['name']}")
+        logger.info(f"检查时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         # 获取用户资料
+        logger.info("正在获取用户资料...")
         profile_data = await fetch_profile_data(session, token_config['token'])
         username = profile_data.get('username', '未知用户')
+        logger.info(f"用户名: {username}")
         
         # 获取当前Epoch收益数据
+        logger.info("正在获取Epoch收益数据...")
         current_epoch_data = await fetch_epoch_earnings(session, token_config['token'])
         
         # 获取上次的Epoch收益数据
@@ -54,7 +71,13 @@ async def monitor_single_token(session, token_config, webhook_url, use_proxy, pr
         current_epoch_stats = group_epoch_data(current_epoch_data)
         previous_epoch_stats = group_epoch_data(previous_epoch_data)
         
+        # 检查是否有收益变化
+        has_earnings_changed = should_send_epoch_notification(current_epoch_stats, previous_epoch_stats)
+        if has_earnings_changed:
+            logger.info("\n检测到Epoch收益变化!")
+        
         # 获取节点数据
+        logger.info("正在获取节点状态...")
         result_data, total_uptime, online_count, offline_count = await fetch_nodes_data(
             session=session,
             api_url=API_URL,
@@ -62,27 +85,39 @@ async def monitor_single_token(session, token_config, webhook_url, use_proxy, pr
         )
         
         if not result_data:
-            print(f"获取节点数据失败，跳过此token: {token_config['name']}")
+            logger.error(f"获取节点数据失败，跳过此token: {token_config['name']}")
             return
+            
+        # 判断是否需要发送通知
+        should_notify = ALWAYS_NOTIFY or has_earnings_changed
         
-        # 构建合并消息
-        message = build_combined_message(
-            token_name=token_config['name'],
-            username=username,
-            current_epoch_stats=current_epoch_stats,
-            previous_epoch_stats=previous_epoch_stats,
-            result_data=result_data,
-            total_uptime=total_uptime,
-            online_count=online_count,
-            offline_count=offline_count
-        )
-        
-        # 发送合并消息
-        if message:
-            await send_message_async(webhook_url, message, use_proxy, proxy_url)
+        if should_notify:
+            logger.info("构建通知消息...")
+            message = build_combined_message(
+                token_name=token_config['name'],
+                username=username,
+                current_epoch_stats=current_epoch_stats,
+                previous_epoch_stats=previous_epoch_stats,
+                result_data=result_data,
+                total_uptime=total_uptime,
+                online_count=online_count,
+                offline_count=offline_count,
+                has_earnings_changed=has_earnings_changed
+            )
+            
+            if message:
+                logger.info(" 发送通知消息...")
+                await send_message_async(webhook_url, message, use_proxy, proxy_url)
+                logger.info("✅ 消息发送成功")
+        else:
+            logger.info("无变化，跳过通知")
             
     except Exception as e:
-        print(f"监控Token {token_config['name']} 时出错: {str(e)}")
+        logger.error(f"❌ 监控Token {token_config['name']} 时出错: {str(e)}")
+        
+    finally:
+        logger.info(f"检查完成: {token_config['name']}")
+        logger.info('='*50 + '\n')
 
 def group_epoch_data(epoch_data):
     """按epoch分组统计数据"""
@@ -97,62 +132,60 @@ def group_epoch_data(epoch_data):
         }
     return epoch_stats
 
-def build_combined_message(token_name, username, current_epoch_stats, previous_epoch_stats, result_data, total_uptime, online_count, offline_count):
+def should_send_epoch_notification(current_stats, previous_stats):
+    """判断是否需要发送epoch收益通知"""
+    for epoch_name, current in current_stats.items():
+        previous = previous_stats.get(epoch_name, {})
+        if current.get('modified') != previous.get('modified'):
+            return True
+    return False
+
+def build_combined_message(token_name, username, current_epoch_stats, previous_epoch_stats, 
+                         result_data, total_uptime, online_count, offline_count, has_earnings_changed):
     """构建合并后的用户信息消息"""
     adjusted_time = datetime.now() + timedelta(hours=TIME_OFFSET)
     timestamp = adjusted_time.strftime('%Y-%m-%d %H:%M:%S')
     
+    # 基础信息
     message_lines = [
-        f"🔍 【{APP_NAME} 用户报告】",
+        f"🔍 【{APP_NAME} 状态报告】",
         f"⏰ 时间: {timestamp}",
-        f"👤 账户: {token_name} ({username})\n",
-        f"📊 节点统计:",
+        f"👤 账户: {token_name} ({username})",
+        
+        # 节点状态摘要
+        f"\n📡 节点状态:",
         f"  • 总节点数: {len(result_data)}",
         f"  • 在线节点: {online_count}",
         f"  • 离线节点: {offline_count}",
-        f"  • 总运行时间: {format_uptime(total_uptime)}\n",
-        f"📊 当前收益统计:"
+        f"  • 总运行时间: {format_uptime(total_uptime)}"
     ]
     
-    for epoch_name, stats in current_epoch_stats.items():
-        # 计算当前的总积分
-        current_epoch_points = stats['totalPoints'] + stats['rewardPoints']
-        current_referral_points = stats['referralPoints']
-        
-        # 获取上一次的数据
-        previous_stats = previous_epoch_stats.get(epoch_name, {})
-        previous_epoch_points = previous_stats.get('totalPoints', 0) + previous_stats.get('rewardPoints', 0)
-        previous_referral_points = previous_stats.get('referralPoints', 0)
-        
-        # 计算增量
-        epoch_points_increase = current_epoch_points - previous_epoch_points
-        referral_points_increase = current_referral_points - previous_referral_points
-        
-        # 构建显示字符串
-        epoch_points_str = f"{current_epoch_points:,}"
-        if epoch_points_increase > 0 and stats.get('modified') != previous_stats.get('modified'):
-            epoch_points_str += f"(+{epoch_points_increase:,})"
+    # 只在有收益变化时显示详细的收益信息
+    if has_earnings_changed:
+        message_lines.append("\n💰 收益变化:")
+        for epoch_name, stats in current_epoch_stats.items():
+            # 计算当前的总积分
+            current_epoch_points = stats['totalPoints'] + stats['rewardPoints']
+            current_referral_points = stats['referralPoints']
             
-        referral_points_str = f"{current_referral_points:,}"
-        if referral_points_increase > 0 and stats.get('modified') != previous_stats.get('modified'):
-            referral_points_str += f"(+{referral_points_increase:,})"
+            # 获取上一次的数据
+            previous_stats = previous_epoch_stats.get(epoch_name, {})
+            previous_epoch_points = previous_stats.get('totalPoints', 0) + previous_stats.get('rewardPoints', 0)
+            previous_referral_points = previous_stats.get('referralPoints', 0)
             
-        message_lines.extend([
-            f"\n{epoch_name}:",
-            f"  • 总积分: {epoch_points_str}",
-            f"  • 推荐奖励: {referral_points_str}",
-            f"  • 运行时间: {format_uptime(stats['totalUptime'])}"
-        ])
-    
-    message_lines.append("\n📊 上次收益统计:")
-    for epoch_name, stats in previous_epoch_stats.items():
-        total_points = stats['totalPoints'] + stats['rewardPoints']
-        message_lines.extend([
-            f"\n{epoch_name}:",
-            f"  • 总积分: {total_points:,}",
-            f"  • 推荐奖励: {stats['referralPoints']:,}",
-            f"  • 运行时间: {format_uptime(stats['totalUptime'])}"
-        ])
+            # 计算增量
+            epoch_points_increase = current_epoch_points - previous_epoch_points
+            referral_points_increase = current_referral_points - previous_referral_points
+            
+            if epoch_points_increase > 0 or referral_points_increase > 0:
+                message_lines.extend([
+                    f"\n{epoch_name}:",
+                    f"  • 总积分: {current_epoch_points:,} (+{epoch_points_increase:,})",
+                    f"  • 推荐奖励: {current_referral_points:,} (+{referral_points_increase:,})",
+                    f"  • 运行时间: {format_uptime(stats['totalUptime'])}"
+                ])
+    else:
+        message_lines.append("\n💡 无收益变化")
     
     return "\n".join(message_lines)
 
@@ -197,9 +230,9 @@ async def send_message_async(webhook_url, message_content, use_proxy, proxy_url)
     async with aiohttp.ClientSession() as session:
         async with session.post(webhook_url, json=payload, headers=headers, proxy=proxy) as response:
             if response.status == 200:
-                print("Message sent successfully!")
+                logger.info("Message sent successfully!")
             else:
-                print(f"Failed to send message: {response.status}, {await response.text()}")
+                logger.error(f"Failed to send message: {response.status}, {await response.text()}")
 
 
 async def fetch_nodes_data(session, api_url, api_token):
@@ -215,10 +248,10 @@ async def fetch_nodes_data(session, api_url, api_token):
     
     try:
         async with session.get(api_url, headers=headers, timeout=30, ssl=False) as response:
-            print(f"响应状态码: {response.status}")
+            logger.info(f"响应状态码: {response.status}")
             
             if response.status == 403:
-                print(f"Token认证失败，请检查token是否有效: {api_token}")
+                logger.error(f"Token认证失败，请检查token是否有效: {api_token}")
                 return None, 0, 0, 0
             elif response.status == 200:
                 data = await response.json()
@@ -226,21 +259,33 @@ async def fetch_nodes_data(session, api_url, api_token):
                 # 获取原始节点数据
                 raw_nodes = data.get('result', {}).get('data', {}).get('data', [])
                 if SHOW_DETAIL:
-                    print(f"获取到的节点数量: {len(raw_nodes)}")
-                    # print(f"节点数据结构: {raw_nodes}")
+                    logger.info(f"获取到的节点数量: {len(raw_nodes)}")
                 
                 if raw_nodes:
                     try:
-                        # 提取每个节点的关键信息
+                        # 提取每个节点的关键信息并排序
                         result_data = [extract_node_info(node) for node in raw_nodes]
                         
-                        # 只获取在线节点
+                        # 按状态和IP分数排序
+                        result_data.sort(key=lambda x: (-x['isConnected'], -x['ipScore'], x['ipAddress']))
+                        
+                        # 打印排序后的节点信息
+                        logger.info("\n节点状态列表:")
+                        for node in result_data:
+                            log_message = (
+                                f"{'🟢' if node['isConnected'] else '🔴'} "
+                                f"{node['ipAddress']}({node['ipScore']}分) "
+                                f"{node['countryCode']} {node['multiplier']}x "
+                                f"节点 {node['deviceId'][:8]}..."
+                            )
+                            logger.info(log_message)
+                        
+                        # 检查在线节点的重复IP
                         online_nodes = [
                             node for node in result_data 
                             if node['ipScore'] > 0 and node['isConnected']
                         ]
                         
-                        # 检查在线节点的重复IP
                         ip_count = {}
                         duplicate_ips = set()
                         for node in online_nodes:
@@ -252,38 +297,40 @@ async def fetch_nodes_data(session, api_url, api_token):
                         
                         # 如果发现重复IP，打印警告
                         if duplicate_ips:
-                            print("\n⚠️ 发现在线节点重复IP:")
+                            logger.warning("\n⚠️ 发现在线节点重复IP:")
                             for ip in duplicate_ips:
                                 duplicate_nodes = [
                                     node for node in online_nodes 
                                     if node.get('ipAddress') == ip
                                 ]
-                                print(f"IP {ip} 被以下在线设备使用:")
+                                logger.warning(f"IP {ip} 被以下在线设备使用:")
                                 for node in duplicate_nodes:
-                                    print(f"  - 设备ID: {node.get('deviceId')}")
+                                    logger.warning(f"  - 设备ID: {node.get('deviceId')}")
                         
-                        # 使用提取的数据计算统计信息
+                        # 计算统计信息
                         total_uptime = sum(node['totalUptime'] for node in result_data)
-                        online_nodes = [node for node in result_data if node['ipScore'] > 0 and node['isConnected']]
-                        offline_nodes = [node for node in result_data if node['ipScore'] == 0 or not node['isConnected']]
+                        online_count = len(online_nodes)
+                        offline_count = len(result_data) - online_count
                         
-                        print(f"\n总在线时间: {total_uptime}秒")
-                        print(f"在线节点数量: {len(online_nodes)}")
-                        print(f"离线节点数量: {len(offline_nodes)}")
+                        logger.info(f"节点统计:")
+                        logger.info(f"• 总在线时间: {format_uptime(total_uptime)}")
+                        logger.info(f"• 在线节点数: {online_count}")
+                        logger.info(f"• 离线节点数: {offline_count}")
                         
-                        return result_data, total_uptime, len(online_nodes), len(offline_nodes)
+                        return result_data, total_uptime, online_count, offline_count
+                        
                     except Exception as e:
-                        print(f"处理数据时出错: {str(e)}")
+                        logger.error(f"处理数据时出错: {str(e)}")
                         raise
                 else:
-                    print("未获取到节点数据")
+                    logger.error("未获取到节点数据")
                     return None, 0, 0, 0
             else:
-                print(f"API请求失败: {response.status}")
+                logger.error(f"API请求失败: {response.status}")
                 return None, 0, 0, 0
                 
     except Exception as e:
-        print(f"获取数据失败: {str(e)}")
+        logger.error(f"获取数据失败: {str(e)}")
         return None, 0, 0, 0
 
 async def fetch_profile_data(session, api_token):
@@ -306,7 +353,7 @@ async def fetch_profile_data(session, api_token):
                 error_text = await response.text()
                 raise Exception(f"获取个人资料失败: {response.status}, 错误信息: {error_text}")
     except Exception as e:
-        print(f"获取个人资料失败: {str(e)}")
+        logger.error(f"获取个人资料失败: {str(e)}")
         raise
 
 async def fetch_epoch_earnings(session, api_token):
@@ -328,7 +375,7 @@ async def fetch_epoch_earnings(session, api_token):
                 error_text = await response.text()
                 raise Exception(f"获取Epoch收益数据失败: {response.status}, 错误信息: {error_text}")
     except Exception as e:
-        print(f"获取Epoch收益数据失败: {str(e)}")
+        logger.error(f"获取Epoch收益数据失败: {str(e)}")
         raise
 
 def build_epoch_stats_message(epoch_data, username):
@@ -355,22 +402,25 @@ def build_epoch_stats_message(epoch_data, username):
     return "\n".join(message_lines)
 
 async def monitor_nodes(interval, webhook_url, use_proxy, proxy_url, always_notify=False):
-    """监控节点状���"""
+    """监控节点状态"""
+    iteration = 1
     while True:
         try:
-            # 为每个token创建独立的监控任务，每个任务使用独立的session
-            tasks = []
+            print(f"\n开始第 {iteration} 轮检查...")
+            
+            # 串行执行每个token的监控
             for token_config in TOKENS_CONFIG:
-                task = monitor_token_with_session(
+                await monitor_token_with_session(
                     token_config=token_config,
                     webhook_url=webhook_url,
                     use_proxy=use_proxy,
                     proxy_url=proxy_url
                 )
-                tasks.append(task)
-            
-            # 并发执行所有token的监控任务
-            await asyncio.gather(*tasks)
+                # 在每个token检查之间添加随机延迟
+                await random_delay()
+                
+            print(f"第 {iteration} 轮检查完成\n")
+            iteration += 1
             
         except Exception as e:
             print(f"监控过程出错: {str(e)}")
@@ -391,9 +441,9 @@ async def monitor_token_with_session(token_config, webhook_url, use_proxy, proxy
             proxy_url=proxy_url
         )
 
-def extract_node_info(node, time_offset=8):
+def extract_node_info(node):
     """提取节点的关键信息"""
-    info = {
+    return {
         # 基础信息
         'deviceId': node.get('deviceId'),
         'name': node.get('name'),
@@ -413,18 +463,6 @@ def extract_node_info(node, time_offset=8):
         'multiplier': node.get('multiplier', 1),
         'totalPoints': node.get('totalPoints', 0)
     }
-    
-    # 构建单行日志
-    log_message = (
-        f"{'🟢' if info['isConnected'] else '🔴'} "
-        f"{info['ipAddress']}({info['ipScore']}分) "
-        f"{info['countryCode']} {info['multiplier']}x "
-        f"节点 {info['deviceId'][:8]}... | "
-    )
-    
-    print(log_message)
-    
-    return info
 
 if __name__ == "__main__":
     asyncio.run(monitor_nodes(
