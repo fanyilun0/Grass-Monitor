@@ -1,0 +1,38 @@
+version: '3.8'
+services:
+  grass-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: grass-monitor
+    volumes:
+      - type: bind
+        source: .
+        target: /app/src
+        read_only: true
+      - type: volume
+        source: grass-data
+        target: /app/data
+    environment:
+      - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
+      - IS_DOCKER=true
+      - HTTP_PROXY=http://host.docker.internal:7890
+      - HTTPS_PROXY=http://host.docker.internal:7890
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  grass-data:
